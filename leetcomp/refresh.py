@@ -55,10 +55,8 @@ def get_content_query(post_id: int) -> dict[Any, Any]:
     return query
 
 
-def get_post_content_selenium(topic_id: int, slug: str) -> str:
-    """Extract post content using selenium from LeetCode discuss URL"""
-    url = f"https://leetcode.com/discuss/post/{topic_id}/{slug}/"
-
+def create_chrome_driver() -> webdriver.Chrome:
+    """Create and configure Chrome driver for selenium operations"""
     # Setup Chrome options for headless operation
     options = Options()
     options.add_argument("--headless")
@@ -72,7 +70,14 @@ def get_post_content_selenium(topic_id: int, slug: str) -> str:
     )
 
     service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    return webdriver.Chrome(service=service, options=options)
+
+
+def get_post_content_selenium(
+    driver: webdriver.Chrome, topic_id: int, slug: str
+) -> str:
+    """Extract post content using selenium from LeetCode discuss URL"""
+    url = f"https://leetcode.com/discuss/post/{topic_id}/{slug}/"
 
     try:
         driver.get(url)
@@ -105,8 +110,6 @@ def get_post_content_selenium(topic_id: int, slug: str) -> str:
         raise FetchContentException(
             f"Failed to extract content from URL {url}: {str(e)}"
         )
-    finally:
-        driver.quit()
 
 
 @retry_with_exp_backoff(retries=config["app"]["n_api_retries"])  # type: ignore
@@ -146,7 +149,9 @@ def post_content(post_id: int) -> str:
 
 
 @retry_with_exp_backoff(retries=config["app"]["n_api_retries"])  # type: ignore
-def parsed_posts_new(skip: int, first: int) -> Iterator[LeetCodePost]:
+def parsed_posts_new(
+    skip: int, first: int, driver: webdriver.Chrome | None = None
+) -> Iterator[LeetCodePost]:
     """parse posts using new ugcArticleDiscussionArticles api with selenium content extraction"""
     query = get_posts_query(skip, first)
     response = requests.post(config["app"]["leetcode_graphql_url"], json=query)
@@ -184,12 +189,17 @@ def parsed_posts_new(skip: int, first: int) -> Iterator[LeetCodePost]:
         creation_date = datetime.fromisoformat(created_at.replace("+00:00", ""))
 
         # Extract full content using selenium instead of summary
-        try:
-            content = get_post_content_selenium(node["topicId"], node["slug"])
-        except FetchContentException as e:
-            print(
-                f"Warning: Failed to extract content for post {node['topicId']}, using summary - {e}"
-            )
+        if driver:
+            try:
+                content = get_post_content_selenium(
+                    driver, node["topicId"], node["slug"]
+                )
+            except FetchContentException as e:
+                print(
+                    f"Warning: Failed to extract content for post {node['topicId']}, using summary - {e}"
+                )
+                content = node.get("summary", "")
+        else:
             content = node.get("summary", "")
 
         yield LeetCodePost(
@@ -246,14 +256,17 @@ def parsed_posts_legacy(skip: int, first: int) -> Iterator[LeetCodePost]:
 
 
 def parsed_posts(
-    skip: int, first: int, cutoff_date: datetime
+    skip: int,
+    first: int,
+    cutoff_date: datetime,
+    driver: webdriver.Chrome | None = None,
 ) -> Iterator[LeetCodePost]:
     """automatically switch between apis based on date"""
     march_2025 = datetime(2025, 3, 1)
 
     if cutoff_date > march_2025:
         try:
-            yield from parsed_posts_new(skip, first)
+            yield from parsed_posts_new(skip, first, driver)
         except FetchPostsException as e:
             print(f"new api failed, falling back to legacy: {e}")
             yield from parsed_posts_legacy(skip, first)
@@ -268,40 +281,60 @@ def get_latest_posts(
     has_crossed_till_date = False
     fetched_posts, skips_due_to_lag = 0, 0
 
-    with open(comps_path, "a") as f:
-        while not has_crossed_till_date:
-            post_count_in_batch = 0
+    # Create Chrome driver once for the entire run
+    driver = None
+    march_2025 = datetime(2025, 3, 1)
+    if start_date > march_2025:
+        print("Creating Chrome driver for content extraction...")
+        try:
+            driver = create_chrome_driver()
+        except Exception as e:
+            print(
+                f"Warning: Failed to create Chrome driver, will use summaries only - {e}"
+            )
+            driver = None
 
-            for post in parsed_posts(skip, first, start_date):  # type: ignore[unused-ignore]
-                post_count_in_batch += 1
+    try:
+        with open(comps_path, "a") as f:
+            while not has_crossed_till_date:
+                post_count_in_batch = 0
 
-                if post.creation_date > start_date:
-                    skips_due_to_lag += 1
-                    continue
+                for post in parsed_posts(skip, first, start_date, driver):  # type: ignore[unused-ignore]
+                    post_count_in_batch += 1
 
-                if post.creation_date <= till_date:
-                    has_crossed_till_date = True
+                    if post.creation_date > start_date:
+                        skips_due_to_lag += 1
+                        continue
+
+                    if post.creation_date <= till_date:
+                        has_crossed_till_date = True
+                        break
+
+                    post_dict = asdict(post)
+                    post_dict["creation_date"] = post.creation_date.strftime(
+                        config["app"]["date_fmt"]
+                    )
+                    f.write(json.dumps(post_dict) + "\n")
+                    fetched_posts += 1
+
+                    if fetched_posts % 10 == 0:
+                        print(
+                            f"{post.creation_date} Fetched {fetched_posts} posts..."
+                        )
+
+                if post_count_in_batch == 0:
                     break
 
-                post_dict = asdict(post)
-                post_dict["creation_date"] = post.creation_date.strftime(
-                    config["app"]["date_fmt"]
-                )
-                f.write(json.dumps(post_dict) + "\n")
-                fetched_posts += 1
+                skip += first
 
-                if fetched_posts % 10 == 0:
-                    print(
-                        f"{post.creation_date} Fetched {fetched_posts} posts..."
-                    )
-
-            if post_count_in_batch == 0:
-                break
-
-            skip += first
-
-        print(f"Skipped {skips_due_to_lag} posts due to lag...")
-        print(f"{post.creation_date} Fetched {fetched_posts} posts in total!")
+            print(f"Skipped {skips_due_to_lag} posts due to lag...")
+            print(
+                f"{post.creation_date} Fetched {fetched_posts} posts in total!"
+            )
+    finally:
+        if driver:
+            print("Closing Chrome driver...")
+            driver.quit()
 
 
 if __name__ == "__main__":
