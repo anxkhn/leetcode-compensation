@@ -4,6 +4,13 @@ from datetime import datetime, timedelta
 from typing import Any, Iterator
 
 import requests  # type: ignore
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
 
 from leetcomp.errors import FetchContentException, FetchPostsException
 from leetcomp.queries import COMP_POST_CONTENT_DATA_QUERY as content_query
@@ -48,6 +55,60 @@ def get_content_query(post_id: int) -> dict[Any, Any]:
     return query
 
 
+def get_post_content_selenium(topic_id: int, slug: str) -> str:
+    """Extract post content using selenium from LeetCode discuss URL"""
+    url = f"https://leetcode.com/discuss/post/{topic_id}/{slug}/"
+
+    # Setup Chrome options for headless operation
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+
+    try:
+        driver.get(url)
+
+        # Check if page loaded successfully (check title for 404/error indicators)
+        page_title = driver.title.lower()
+        if (
+            "404" in page_title
+            or "not found" in page_title
+            or "error" in page_title
+        ):
+            raise FetchContentException(
+                f"Post not found at URL {url} (title: {driver.title})"
+            )
+
+        # Wait until the post content div appears
+        element = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.mYe_l.TAIHK"))
+        )
+
+        content = element.text.strip()
+        if not content:
+            raise FetchContentException(
+                f"No content found in post at URL {url}"
+            )
+
+        return str(content)
+
+    except Exception as e:
+        raise FetchContentException(
+            f"Failed to extract content from URL {url}: {str(e)}"
+        )
+    finally:
+        driver.quit()
+
+
 @retry_with_exp_backoff(retries=config["app"]["n_api_retries"])  # type: ignore
 def post_content(post_id: int) -> str:
     query = get_content_query(post_id)
@@ -67,16 +128,14 @@ def post_content(post_id: int) -> str:
     # Check if topic exists and has a post
     topic = data.get("topic")
     if not topic:
-        raise FetchContentException(
-            f"Topic not found for post_id={post_id}"
-        )
-    
+        raise FetchContentException(f"Topic not found for post_id={post_id}")
+
     post = topic.get("post")
     if not post:
         raise FetchContentException(
             f"Post content not available for post_id={post_id} (post may be deleted or private)"
         )
-    
+
     content = post.get("content")
     if content is None:
         raise FetchContentException(
@@ -87,8 +146,8 @@ def post_content(post_id: int) -> str:
 
 
 @retry_with_exp_backoff(retries=config["app"]["n_api_retries"])  # type: ignore
-def parsed_posts(skip: int, first: int) -> Iterator[LeetCodePost]:
-    """parse posts using new ugcArticleDiscussionArticles api"""
+def parsed_posts_new(skip: int, first: int) -> Iterator[LeetCodePost]:
+    """parse posts using new ugcArticleDiscussionArticles api with selenium content extraction"""
     query = get_posts_query(skip, first)
     response = requests.post(config["app"]["leetcode_graphql_url"], json=query)
 
@@ -109,22 +168,30 @@ def parsed_posts(skip: int, first: int) -> Iterator[LeetCodePost]:
         raise FetchPostsException(
             f"No ugcArticleDiscussionArticles found in response for skip={skip}, first={first}"
         )
-    
+
     posts = posts_data.get("edges", [])
 
     for post in posts:
         node = post["node"]
-        
+
         vote_count = 0
         for reaction in node.get("reactions", []):
             if reaction["reactionType"] == "UPVOTE":
                 vote_count = reaction["count"]
                 break
-        
+
         created_at = node["createdAt"]
         creation_date = datetime.fromisoformat(created_at.replace("+00:00", ""))
-        content = node.get("summary", "")
-        
+
+        # Extract full content using selenium instead of summary
+        try:
+            content = get_post_content_selenium(node["topicId"], node["slug"])
+        except FetchContentException as e:
+            print(
+                f"Warning: Failed to extract content for post {node['topicId']}, using summary - {e}"
+            )
+            content = node.get("summary", "")
+
         yield LeetCodePost(
             id=str(node["topicId"]),
             title=node["title"],
@@ -164,7 +231,7 @@ def parsed_posts_legacy(skip: int, first: int) -> Iterator[LeetCodePost]:
         except FetchContentException as e:
             print(f"Warning: Skipping post {post['node']['id']} - {e}")
             continue
-        
+
         yield LeetCodePost(
             id=post["node"]["id"],
             title=post["node"]["title"],
@@ -178,18 +245,20 @@ def parsed_posts_legacy(skip: int, first: int) -> Iterator[LeetCodePost]:
         )
 
 
-def parsed_posts(skip: int, first: int, cutoff_date: datetime) -> Iterator[LeetCodePost]:
+def parsed_posts(
+    skip: int, first: int, cutoff_date: datetime
+) -> Iterator[LeetCodePost]:
     """automatically switch between apis based on date"""
     march_2025 = datetime(2025, 3, 1)
-    
+
     if cutoff_date > march_2025:
         try:
-            return parsed_posts(skip, first)
+            yield from parsed_posts_new(skip, first)
         except FetchPostsException as e:
             print(f"new api failed, falling back to legacy: {e}")
-            return parsed_posts_legacy(skip, first)
+            yield from parsed_posts_legacy(skip, first)
     else:
-        return parsed_posts_legacy(skip, first)
+        yield from parsed_posts_legacy(skip, first)
 
 
 def get_latest_posts(
@@ -202,10 +271,10 @@ def get_latest_posts(
     with open(comps_path, "a") as f:
         while not has_crossed_till_date:
             post_count_in_batch = 0
-            
+
             for post in parsed_posts(skip, first, start_date):  # type: ignore[unused-ignore]
                 post_count_in_batch += 1
-                
+
                 if post.creation_date > start_date:
                     skips_due_to_lag += 1
                     continue
@@ -228,7 +297,7 @@ def get_latest_posts(
 
             if post_count_in_batch == 0:
                 break
-                
+
             skip += first
 
         print(f"Skipped {skips_due_to_lag} posts due to lag...")
