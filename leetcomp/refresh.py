@@ -8,6 +8,7 @@ import requests  # type: ignore
 from leetcomp.errors import FetchContentException, FetchPostsException
 from leetcomp.queries import COMP_POST_CONTENT_DATA_QUERY as content_query
 from leetcomp.queries import COMP_POSTS_DATA_QUERY as posts_query
+from leetcomp.queries import COMP_POSTS_DATA_QUERY_LEGACY as posts_query_legacy
 from leetcomp.utils import (
     config,
     latest_parsed_date,
@@ -29,6 +30,13 @@ class LeetCodePost:
 
 def get_posts_query(skip: int, first: int) -> dict[Any, Any]:
     query = posts_query.copy()
+    query["variables"]["skip"] = skip  # type: ignore
+    query["variables"]["first"] = first  # type: ignore
+    return query
+
+
+def get_posts_query_legacy(skip: int, first: int) -> dict[Any, Any]:
+    query = posts_query_legacy.copy()
     query["variables"]["skip"] = skip  # type: ignore
     query["variables"]["first"] = first  # type: ignore
     return query
@@ -80,7 +88,58 @@ def post_content(post_id: int) -> str:
 
 @retry_with_exp_backoff(retries=config["app"]["n_api_retries"])  # type: ignore
 def parsed_posts(skip: int, first: int) -> Iterator[LeetCodePost]:
+    """parse posts using new ugcArticleDiscussionArticles api"""
     query = get_posts_query(skip, first)
+    response = requests.post(config["app"]["leetcode_graphql_url"], json=query)
+
+    if response.status_code != 200:
+        raise FetchPostsException(
+            f"Failed to fetch content for skip={skip}, first={first}): {response.text}"
+        )
+
+    response_json = response.json()
+    data = response_json.get("data")
+    if not data:
+        raise FetchPostsException(
+            f"Invalid response data for skip={skip}, first={first}"
+        )
+
+    posts_data = data.get("ugcArticleDiscussionArticles")
+    if not posts_data:
+        raise FetchPostsException(
+            f"No ugcArticleDiscussionArticles found in response for skip={skip}, first={first}"
+        )
+    
+    posts = posts_data.get("edges", [])
+
+    for post in posts:
+        node = post["node"]
+        
+        vote_count = 0
+        for reaction in node.get("reactions", []):
+            if reaction["reactionType"] == "UPVOTE":
+                vote_count = reaction["count"]
+                break
+        
+        created_at = node["createdAt"]
+        creation_date = datetime.fromisoformat(created_at.replace("+00:00", ""))
+        content = node.get("summary", "")
+        
+        yield LeetCodePost(
+            id=str(node["topicId"]),
+            title=node["title"],
+            content=content,
+            vote_count=vote_count,
+            comment_count=node.get("topic", {}).get("topLevelCommentCount", 0),
+            view_count=node.get("hitCount", 0),
+            creation_date=creation_date,
+        )
+
+
+@retry_with_exp_backoff(retries=config["app"]["n_api_retries"])  # type: ignore
+def parsed_posts_legacy(skip: int, first: int) -> Iterator[LeetCodePost]:
+    """parse posts using legacy categoryTopicList api"""
+    query = get_posts_query_legacy(skip, first)
     response = requests.post(config["app"]["leetcode_graphql_url"], json=query)
 
     if response.status_code != 200:
@@ -119,6 +178,20 @@ def parsed_posts(skip: int, first: int) -> Iterator[LeetCodePost]:
         )
 
 
+def parsed_posts(skip: int, first: int, cutoff_date: datetime) -> Iterator[LeetCodePost]:
+    """automatically switch between apis based on date"""
+    march_2025 = datetime(2025, 3, 1)
+    
+    if cutoff_date > march_2025:
+        try:
+            return parsed_posts(skip, first)
+        except FetchPostsException as e:
+            print(f"new api failed, falling back to legacy: {e}")
+            return parsed_posts_legacy(skip, first)
+    else:
+        return parsed_posts_legacy(skip, first)
+
+
 def get_latest_posts(
     comps_path: str, start_date: datetime, till_date: datetime
 ) -> None:
@@ -128,7 +201,11 @@ def get_latest_posts(
 
     with open(comps_path, "a") as f:
         while not has_crossed_till_date:
-            for post in parsed_posts(skip, first):  # type: ignore[unused-ignore]
+            post_count_in_batch = 0
+            
+            for post in parsed_posts(skip, first, start_date):  # type: ignore[unused-ignore]
+                post_count_in_batch += 1
+                
                 if post.creation_date > start_date:
                     skips_due_to_lag += 1
                     continue
@@ -149,6 +226,9 @@ def get_latest_posts(
                         f"{post.creation_date} Fetched {fetched_posts} posts..."
                     )
 
+            if post_count_in_batch == 0:
+                break
+                
             skip += first
 
         print(f"Skipped {skips_due_to_lag} posts due to lag...")
