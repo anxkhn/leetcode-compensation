@@ -57,7 +57,6 @@ def get_content_query(post_id: int) -> dict[Any, Any]:
 
 def create_chrome_driver() -> webdriver.Chrome:
     """Create and configure Chrome driver for selenium operations"""
-    # Setup Chrome options for headless operation
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
@@ -82,7 +81,6 @@ def get_post_content_selenium(
     try:
         driver.get(url)
 
-        # Check if page loaded successfully (check title for 404/error indicators)
         page_title = driver.title.lower()
         if (
             "404" in page_title
@@ -93,7 +91,6 @@ def get_post_content_selenium(
                 f"Post not found at URL {url} (title: {driver.title})"
             )
 
-        # Wait until the post content div appears
         element = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.mYe_l.TAIHK"))
         )
@@ -128,7 +125,6 @@ def post_content(post_id: int) -> str:
             f"Invalid response data for post_id={post_id}"
         )
 
-    # Check if topic exists and has a post
     topic = data.get("topic")
     if not topic:
         raise FetchContentException(f"Topic not found for post_id={post_id}")
@@ -188,7 +184,6 @@ def parsed_posts_new(
         created_at = node["createdAt"]
         creation_date = datetime.fromisoformat(created_at.replace("+00:00", ""))
 
-        # Extract full content using selenium instead of summary
         if driver:
             try:
                 content = get_post_content_selenium(
@@ -281,7 +276,6 @@ def get_latest_posts(
     has_crossed_till_date = False
     fetched_posts, skips_due_to_lag = 0, 0
 
-    # Create Chrome driver once for the entire run
     driver = None
     march_2025 = datetime(2025, 3, 1)
     if start_date > march_2025:
